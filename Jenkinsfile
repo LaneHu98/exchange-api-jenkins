@@ -1,0 +1,238 @@
+pipeline {
+    agent any
+
+    tools {
+        maven 'Maven'
+        jdk 'JDK8'
+    }
+
+    environment {
+        // 构建信息
+        BUILD_VERSION = "${BUILD_ID}-${env.BUILD_TIMESTAMP}"
+        REPO_URL = 'git@github.com:backend-ex/spot_exchange_web.git'
+
+        // 根据不同环境设置变量
+        // 不再将 JSON 对象存储在环境变量中
+        // DEPLOY_CONFIG = readJSON file: "jenkins/configs/test-config.json"
+    }
+
+    stages {
+        stage('初始化') {
+            steps {
+                script {
+                    echo "开始部署 limbo-exchange-web-service 到 test 环境"
+                    echo "构建版本: ${BUILD_VERSION}"
+                    echo "Git分支: ${BRANCH}"
+
+                    // 备份配置文件到临时位置
+                    sh '''
+                        mkdir -p /tmp/jenkins-configs
+                        cp -r jenkins/configs/* /tmp/jenkins-configs/
+                    '''
+
+                    // 读取服务配置
+                    def servicesConfig = readJSON file: 'jenkins/configs/services.json'
+                    def allServices = servicesConfig.collect { it.toString() }
+                    
+
+                    // 存储单个服务
+                    env.ALL_SERVICES = "false"
+                    env.SINGLE_SERVICE = "limbo-exchange-web-service"
+                }
+            }
+        }
+
+        stage('代码检出') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "${BRANCH}"]],
+                    extensions: [],
+                    userRemoteConfigs: [[
+                        url: REPO_URL,
+                        credentialsId: 'github-jenkins-key'
+                    ]]
+                ])
+
+                // 恢复配置文件
+                sh '''
+                    mkdir -p jenkins/configs
+                    cp -r /tmp/jenkins-configs/* jenkins/configs/
+                '''
+
+                // 保存提交信息
+                sh '''
+                    git log -1 --pretty=format:"%H | %an | %ad | %s" > commit_info.txt
+                '''
+            }
+        }
+
+        stage('依赖构建') {
+            steps {
+                dir('.') {
+                    sh 'mvn clean install -DskipTests=true -Dmaven.test.skip=true'
+                }
+            }
+        }
+
+        stage('服务构建') {
+            steps {
+                script {
+                    // 根据环境变量决定要部署的服务
+                    def servicesToDeploy
+                    if (env.ALL_SERVICES == "true") {
+                        // 读取所有服务
+                        def servicesConfig = readJSON file: 'jenkins/configs/services.json'
+                        servicesToDeploy = servicesConfig.collect { it.toString() }
+                    } else {
+                        // 使用单个服务
+                        servicesToDeploy = [env.SINGLE_SERVICE]
+                    }
+
+                    def serviceDirectoryMapping = readJSON file: 'jenkins/configs/service-directory-mapping.json'
+
+                    servicesToDeploy.each { serviceName ->
+                        stage("构建 ${serviceName}") {
+                            // 根据服务名获取对应目录
+                            echo "开始构建服务: ${serviceName}}"
+                            dir("${serviceName}") {
+                                if (params.SKIP_TESTS) {
+                                    sh "mvn clean package -DskipTests"
+                                } else {
+                                    sh "mvn clean package"
+                                }
+
+                                // 归档制品
+                                archiveArtifacts artifacts: "target/*.jar", fingerprint: true
+
+                                // 生成部署包
+                                sh """
+                                    mkdir -p ${WORKSPACE}/deploy-packages/${serviceName}
+                                    cp ${WORKSPACE}/../../deploy/${serviceName}.jar ${WORKSPACE}/deploy-packages/${serviceName}/
+                                    cp src/main/resources/application-prod.properties ${WORKSPACE}/deploy-packages/${serviceName}/ 2>/dev/null || true
+                                """
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('分发部署') {
+            steps {
+                script {
+                    // 根据环境变量决定要部署的服务
+                    def servicesToDeploy
+                    if (env.ALL_SERVICES == "true") {
+                        // 读取所有服务
+                        def servicesConfig = readJSON file: 'jenkins/configs/services.json'
+                        servicesToDeploy = servicesConfig.collect { it.toString() }
+                    } else {
+                        // 使用单个服务
+                        servicesToDeploy = [env.SINGLE_SERVICE]
+                    }
+                    
+                    servicesToDeploy.each { serviceName ->
+                        stage("部署 ${serviceName}") {
+                            def deployConfig = readJSON file: "jenkins/configs/test-config.json"
+                            // 获取该服务的服务器列表
+                            def servers = deployConfig.services[serviceName]?.servers ?: []
+                            if (servers.isEmpty()) {
+                                echo "警告: ${serviceName} 在 test 环境中没有配置服务器"
+                                return
+                            }
+
+                            servers.each { server ->
+                                stage("部署到 ${server.host}:${server.port}") {
+                                    deployToServer(serviceName, server)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// 部署到单台服务器的方法
+def deployToServer(serviceName, serverConfig) {
+    def host = serverConfig.host
+    def port = serverConfig.port ?: 22
+    def deployPath = serverConfig.deployPath ?: "/opt/apps/${serviceName}"
+    def rs = serverConfig.restartScript
+
+    echo "部署 ${serviceName} 到服务器 ${host}，使用脚本: ${rs}"
+
+    // 使用SSH连接服务器执行部署
+    sshagent(['deploy-server-key']) {
+        sh """
+            # 创建目标目录（如果不存在）
+            ssh -p 22 -o StrictHostKeyChecking=no ec2-user@${host} '
+                sudo mkdir -p ${deployPath}/tmp
+                sudo chown -R ec2-user:ec2-user ${deployPath}
+                sudo chmod 755 ${deployPath}
+            '
+                
+            # 上传部署包
+            scp -P ${port} -o StrictHostKeyChecking=no \\
+                ${WORKSPACE}/deploy-packages/${serviceName}/* \\
+                ec2-user@${host}:${deployPath}/tmp/
+
+            # 执行远程部署脚本
+            ssh -p ${port} -o StrictHostKeyChecking=no ec2-user@${host} << ENDSSH
+                cd /home/ec2-user/nokex-app
+
+                # 执行部署脚本并记录PID
+                echo "开始执行部署脚本..."
+                if [ -f "./${rs}.sh" ]; then
+                    sudo ./${rs}.sh tmp > "/tmp/deploy_${serviceName}.log" 2>&1 &
+                    DEPLOY_PID=\$!
+                    echo "部署脚本PID: \$DEPLOY_PID"
+                else
+                    echo "错误: 部署脚本 ./${rs}.sh 不存在"
+                    echo "当前目录文件:"
+                    ls -la
+                    echo "检查脚本是否存在:"
+                    ls -la ${rs}.sh 2>/dev/null || echo "脚本文件不存在"
+                    exit 1
+                fi
+                
+                # 等待应用启动
+                echo "等待应用启动..."
+                sleep 30
+                
+                # 检查应用是否成功启动
+                if ps -p \$DEPLOY_PID > /dev/null; then
+                    echo "部署脚本仍在运行"
+                    # 检查Java进程是否启动
+                    JAVA_PIDS=\$(ps -ef | grep "java" | grep "${serviceName}" | grep -v grep | awk '{print \$2}')
+                    if [ -n "\$JAVA_PIDS" ]; then
+                        echo "Java应用已启动，PID: \$JAVA_PIDS"
+                    else
+                        echo "警告: Java应用可能未成功启动"
+                        # 显示部署日志的最后几行用于调试
+                        if [ -f "/tmp/deploy_${serviceName}.log" ]; then
+                            echo "=== 部署日志最后20行 ==="
+                            tail -20 /tmp/deploy_${serviceName}.log
+                            echo "========================"
+                        fi
+                    fi
+                else
+                    echo "部署脚本已结束"
+                    # 检查部署日志
+                    if [ -f "/tmp/deploy_${serviceName}.log" ]; then
+                        echo "=== 部署日志最后20行 ==="
+                        tail -20 /tmp/deploy_${serviceName}.log
+                        echo "========================"
+                    else
+                        echo "错误: 部署日志文件不存在"
+                    fi
+                fi
+                
+                echo "部署流程完成"
+
+ENDSSH
+        """
+    }
+}
