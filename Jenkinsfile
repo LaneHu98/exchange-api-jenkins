@@ -9,7 +9,7 @@ pipeline {
     environment {
         // 构建信息
         BUILD_VERSION = "${BUILD_ID}-${env.BUILD_TIMESTAMP}"
-        REPO_URL = 'git@github.com:backend-ex/spot_exchange_web.git'
+        REPO_URL = 'git@github.com:backend-ex/spot_exchange.git'
 
         // 根据不同环境设置变量
         // 不再将 JSON 对象存储在环境变量中
@@ -20,7 +20,7 @@ pipeline {
         stage('初始化') {
             steps {
                 script {
-                    echo "开始部署 limbo-exchange-web-service 到 test 环境"
+                    echo "开始部署 limbo-exchange-service 到 test 环境"
                     echo "构建版本: ${BUILD_VERSION}"
                     echo "Git分支: ${BRANCH}"
 
@@ -37,7 +37,7 @@ pipeline {
 
                     // 存储单个服务
                     env.ALL_SERVICES = "false"
-                    env.SINGLE_SERVICE = "limbo-exchange-web-service"
+                    env.SINGLE_SERVICE = "limbo-exchange-service"
                 }
             }
         }
@@ -108,7 +108,7 @@ pipeline {
                                 // 生成部署包
                                 sh """
                                     mkdir -p ${WORKSPACE}/deploy-packages/${serviceName}
-                                    cp ${WORKSPACE}/../../deploy/${serviceName}.jar ${WORKSPACE}/deploy-packages/${serviceName}/
+                                    cp ${WORKSPACE}/../deploy/${serviceName}.jar ${WORKSPACE}/deploy-packages/${serviceName}/
                                     cp src/main/resources/application-prod.properties ${WORKSPACE}/deploy-packages/${serviceName}/ 2>/dev/null || true
                                 """
                             }
